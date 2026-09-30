@@ -134,7 +134,20 @@ class _PendingClarifyPrompt {
   final GatewayClarifyRequest request;
   final int responseGeneration;
 
-  const _PendingClarifyPrompt(this.request, this.responseGeneration);
+  /// True when this prompt arrived as a server→client request (`srq-…`):
+  /// answers go back as a JSON-RPC response frame (single question) or a
+  /// `clarify.lock` (batch), never the legacy `clarify.respond` RPC.
+  final bool serverRequest;
+
+  /// Set when the gateway withdraws the request (`request.cancel`): the
+  /// dialog must close without sending any answer.
+  bool cancelled = false;
+
+  _PendingClarifyPrompt(
+    this.request,
+    this.responseGeneration, {
+    this.serverRequest = false,
+  });
 }
 
 class ChatScreen extends StatefulWidget {
@@ -313,6 +326,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   bool _sensitivePromptRouteOpen = false;
   final List<_PendingClarifyPrompt> _clarifyPromptQueue = [];
   _PendingClarifyPrompt? _activeClarifyPrompt;
+  bool _clarifyRouteOpen = false;
+  final Set<String> _settledClarifyRequestIds = <String>{};
 
   // Voice input / spoken replies
   final FlutterTts _flutterTts = FlutterTts();
@@ -389,6 +404,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
           widget.connection,
         );
         _desktopGateway!.setAsyncEventListener(_handleDesktopAsyncEvent);
+        _desktopGateway!.setServerRequestListener(_handleServerRequestEvent);
         _desktopGateway!.setConnectionListener(_onDesktopConnectionChanged);
         unawaited(_ensureDesktopSession());
       } on ArgumentError {
@@ -469,6 +485,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       ),
     );
     _desktopGateway?.setAsyncEventListener(null);
+    _desktopGateway?.setServerRequestListener(null);
     _desktopGateway?.close();
     _textController.dispose();
     _scrollController.removeListener(_onScroll);
@@ -2580,6 +2597,10 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   void _handleDesktopAsyncEvent(String mobileSessionId, StreamEvent event) {
     if (!mounted || mobileSessionId != widget.session.id) return;
     if (_handlePendingReattachTerminalEvent(event)) return;
+    if (event.type == 'request.cancel') {
+      _cancelServerClarifyPrompt(event.data);
+      return;
+    }
     if (event.type == 'notification.show') {
       final notification = GatewayNotification.fromEventData(event.data);
       if (notification == null) return;
@@ -2889,11 +2910,16 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
 
   void _queueClarifyPrompt(
     Map<String, dynamic> eventData,
-    int responseGeneration,
-  ) {
+    int responseGeneration, {
+    bool serverRequest = false,
+  }) {
     final requests = GatewayClarifyRequest.fromEventDataList(eventData);
     if (requests.isEmpty) return;
     for (final request in requests) {
+      if (serverRequest &&
+          _settledClarifyRequestIds.contains(request.requestId)) {
+        continue;
+      }
       final duplicate =
           _activeClarifyPrompt?.request.identityKey == request.identityKey ||
           _clarifyPromptQueue.any(
@@ -2901,10 +2927,95 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
           );
       if (duplicate) continue;
       _clarifyPromptQueue.add(
-        _PendingClarifyPrompt(request, responseGeneration),
+        _PendingClarifyPrompt(
+          request,
+          responseGeneration,
+          serverRequest: serverRequest,
+        ),
       );
     }
     _drainClarifyPromptQueue();
+  }
+
+  /// Server→client request from the gateway (`srq-…` frames): the backend
+  /// asking this chat for something. Only clarify is implemented here;
+  /// everything else is declined with -32601 so the agent fails fast instead
+  /// of waiting for a deadline this build cannot meet.
+  void _handleServerRequestEvent(
+    String mobileSessionId,
+    ServerRequestEvent request,
+  ) {
+    if (!mounted || mobileSessionId != widget.session.id) return;
+    if (request.method == 'clarify') {
+      final data = Map<String, dynamic>.from(request.params);
+      data['request_id'] = request.id;
+      _queueClarifyPrompt(data, _responseGeneration, serverRequest: true);
+      return;
+    }
+    final gateway = _desktopGateway;
+    if (gateway != null) {
+      unawaited(() async {
+        try {
+          await gateway.rejectServerRequest(request.id);
+        } catch (_) {
+          // Best-effort decline; a dead socket cannot answer here anyway.
+        }
+      }());
+    }
+  }
+
+  /// The gateway withdrew a prompt (`request.cancel`): drop queued prompts
+  /// and close a matching open dialog without answering it.
+  void _cancelServerClarifyPrompt(Map<String, dynamic> data) {
+    final requestId = data['id']?.toString().trim() ?? '';
+    if (requestId.isEmpty) return;
+    _clarifyPromptQueue.removeWhere(
+      (pending) => pending.request.requestId == requestId,
+    );
+    final active = _activeClarifyPrompt;
+    if (active == null || active.request.requestId != requestId) return;
+    active.cancelled = true;
+    if (_clarifyRouteOpen) {
+      Navigator.of(context, rootNavigator: true).pop();
+    } else {
+      _activeClarifyPrompt = null;
+    }
+  }
+
+  /// Routes one clarify answer: server requests answer with a response frame
+  /// (single question) or a per-question `clarify.lock` (batch); legacy event
+  /// prompts keep the historical `clarify.respond` path.
+  Future<void> _respondToClarifyPrompt(
+    DesktopGatewayClient gateway,
+    _PendingClarifyPrompt pending,
+    String answer,
+  ) {
+    final request = pending.request;
+    if (!pending.serverRequest) {
+      return gateway.respondToClarify(
+        requestId: request.requestId,
+        questionId: request.questionId,
+        answer: answer,
+      );
+    }
+    _settledClarifyRequestIds.add(request.requestId);
+    if (_settledClarifyRequestIds.length > 32) {
+      _settledClarifyRequestIds.remove(_settledClarifyRequestIds.first);
+    }
+    final questionId = request.questionId;
+    if (questionId == null) {
+      return gateway.respondToServerRequest(
+        request.requestId,
+        {'answer': answer},
+      );
+    }
+    // Batch: each answer locks one question; the gateway resolves the request
+    // itself once the last question is locked.
+    return gateway.lockClarifyAnswer(
+      requestId: request.requestId,
+      questionId: questionId,
+      answer: answer,
+    );
   }
 
   void _drainClarifyPromptQueue() {
@@ -2920,6 +3031,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
 
     WidgetsBinding.instance.addPostFrameCallback((_) async {
       if (!mounted ||
+          pending.cancelled ||
           pending.responseGeneration != _responseGeneration ||
           _activeClarifyPrompt?.request.identityKey !=
               pending.request.identityKey) {
@@ -2936,18 +3048,17 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         return;
       }
 
+      _clarifyRouteOpen = true;
       final responded = await showDialog<bool>(
         context: context,
         barrierDismissible: true,
         builder: (_) => GatewayClarifyDialog(
           request: pending.request,
-          onRespond: (answer) => desktopGateway.respondToClarify(
-            requestId: pending.request.requestId,
-            questionId: pending.request.questionId,
-            answer: answer,
-          ),
+          onRespond: (answer) =>
+              _respondToClarifyPrompt(desktopGateway, pending, answer),
         ),
       );
+      _clarifyRouteOpen = false;
       if (_activeClarifyPrompt?.request.identityKey ==
           pending.request.identityKey) {
         _activeClarifyPrompt = null;
@@ -2956,15 +3067,13 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       // System Back or a barrier dismiss maps to the official empty answer,
       // matching Hermes Desktop's Skip behavior. Batch questions skip
       // per-question so the remaining questions can still be answered.
+      // A withdrawn request (`request.cancel`) closes silently instead.
       if (responded != true &&
+          !pending.cancelled &&
           mounted &&
           pending.responseGeneration == _responseGeneration) {
         try {
-          await desktopGateway.respondToClarify(
-            requestId: pending.request.requestId,
-            questionId: pending.request.questionId,
-            answer: '',
-          );
+          await _respondToClarifyPrompt(desktopGateway, pending, '');
         } catch (_) {
           if (!mounted) return;
           ScaffoldMessenger.of(context).showSnackBar(

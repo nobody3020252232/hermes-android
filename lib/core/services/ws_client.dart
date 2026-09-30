@@ -170,13 +170,35 @@ class ResumedGatewaySession {
   final String? status;
   final Map<String, dynamic>? inflight;
 
+  /// Still-open server→client requests (clarify/approval …) the gateway
+  /// replays on resume so a reconnecting client re-renders the questions.
+  final List<ServerRequestEvent> openRequests;
+
   const ResumedGatewaySession({
     required this.runtimeSessionId,
     this.running,
     this.status,
     this.inflight,
+    this.openRequests = const [],
   });
 }
+
+/// One server→client JSON-RPC request frame (`srq-…` id): the backend asking
+/// the app something (clarify, approval, …). Answer it with a response frame
+/// carrying the same [id] — [WsClient.sendServerRequestResponse].
+class ServerRequestEvent {
+  final String id;
+  final String method;
+  final Map<String, dynamic> params;
+
+  const ServerRequestEvent({
+    required this.id,
+    required this.method,
+    required this.params,
+  });
+}
+
+typedef ServerRequestCallback = void Function(ServerRequestEvent request);
 
 typedef StreamCallback = void Function(StreamEvent event);
 typedef ConnectionCallback = void Function(bool connected);
@@ -215,6 +237,11 @@ class WsClient {
   ConnectionCallback? onConnectionChanged;
   GatewayReadyCallback? onGatewayReady;
 
+  /// Server→client request listener (clarify/approval … frames). With no
+  /// handler registered, a request frame is declined with -32601 so the
+  /// backend withdraws it instead of waiting for its deadline.
+  ServerRequestCallback? onServerRequest;
+
   factory WsClient(
     String baseUrl, {
     String? token,
@@ -222,6 +249,7 @@ class WsClient {
     String? profile,
     Duration heartbeatInterval = defaultHeartbeatInterval,
     Duration heartbeatDeadline = defaultHeartbeatDeadline,
+    bool advertiseServerRequests = false,
   }) {
     return WsClient._(
       baseUrl,
@@ -230,6 +258,7 @@ class WsClient {
       profile,
       heartbeatInterval,
       heartbeatDeadline,
+      advertiseServerRequests,
     );
   }
 
@@ -240,7 +269,13 @@ class WsClient {
     this._profile,
     this.heartbeatInterval,
     this.heartbeatDeadline,
+    this._advertiseServerRequestsOnConnect,
   );
+
+  /// Whether `connect()` declares `server_requests` support on this socket.
+  /// Opt-in: only sockets wired to answer prompts (via [onServerRequest])
+  /// should promise the backend they can.
+  final bool _advertiseServerRequestsOnConnect;
 
   /// Keepalive cadence mirroring the desktop client
   /// (`apps/shared/src/json-rpc-channel.ts` DEFAULT_HEARTBEAT_*): a
@@ -294,6 +329,11 @@ class WsClient {
         onConnectionChanged?.call(true);
       } catch (_) {
         // Transport observers cannot turn a live socket into setup failure.
+      }
+      // Tell this backend we answer server→client requests (clarify …) —
+      // only sockets wired to answer them opt in.
+      if (_advertiseServerRequestsOnConnect) {
+        unawaited(_advertiseServerRequests(generation));
       }
     } catch (_) {
       _handleClosedConnection(generation);
@@ -500,6 +540,42 @@ class WsClient {
         return;
       }
 
+      // Server→client request (`srq-…` string id + method + params): the
+      // backend asking THIS client something (clarify / approval / …). Not
+      // one of our pending calls — those use integer ids.
+      if (id is String &&
+          method != null &&
+          method != 'event' &&
+          params is Map<String, dynamic>) {
+        final handler = onServerRequest;
+        if (handler != null) {
+          try {
+            handler(
+              ServerRequestEvent(
+                id: id,
+                method: method,
+                params: Map<String, dynamic>.from(params),
+              ),
+            );
+          } catch (_) {
+            // A broken listener must not wedge the socket loop; decline so
+            // the backend withdraws instead of waiting for its deadline.
+            sendServerRequestResponse(
+              id,
+              errorCode: -32603,
+              errorMessage: 'Client handler failed',
+            );
+          }
+        } else {
+          sendServerRequestResponse(
+            id,
+            errorCode: -32601,
+            errorMessage: 'Method not implemented',
+          );
+        }
+        return;
+      }
+
       // Response to a request (has id, may have method for streaming completion)
       if (id != null) {
         final pending = _pending[id];
@@ -669,6 +745,54 @@ class WsClient {
       } catch (_) {
         // Stream observers run only after internal completion and cleanup.
       }
+    }
+  }
+
+  /// Declares that this client answers server→client requests (clarify …).
+  ///
+  /// Sent once per connection after `gateway.ready`. An older backend answers
+  /// `-32601` here; the failure is ignored. Without the declaration the
+  /// backend treats the socket as a pre-capability build and fails every such
+  /// request for it without sending the frame (#112548).
+  Future<void> _advertiseServerRequests(int generation) async {
+    try {
+      await waitForGatewayReady();
+      if (generation != _connectionGeneration || !_connected) return;
+      await send(
+        'client.capabilities',
+        {'server_requests': true},
+        timeout: const Duration(seconds: 10),
+      );
+    } catch (_) {
+      // Annotation-only: never block or fail the socket on this.
+    }
+  }
+
+  /// Writes a raw JSON-RPC response frame for a server→client request.
+  ///
+  /// Best-effort by design: a dead socket drops the frame (the gateway
+  /// replays unanswered requests on the next resume); this never throws.
+  void sendServerRequestResponse(
+    String id, {
+    Map<String, dynamic>? result,
+    int? errorCode,
+    String? errorMessage,
+  }) {
+    final channel = _channel;
+    if (channel == null) return;
+    final frame = <String, dynamic>{'jsonrpc': '2.0', 'id': id};
+    if (errorCode != null) {
+      frame['error'] = {
+        'code': errorCode,
+        'message': errorMessage ?? 'Server request failed',
+      };
+    } else {
+      frame['result'] = result ?? <String, dynamic>{};
+    }
+    try {
+      channel.sink.add(jsonEncode(frame));
+    } catch (_) {
+      // Best-effort: see doc comment.
     }
   }
 
@@ -985,7 +1109,36 @@ class WsClient {
       inflight: rawInflight is Map
           ? Map<String, dynamic>.from(rawInflight)
           : null,
+      openRequests: _parseOpenRequests(payload['open_requests']),
     );
+  }
+
+  /// Parses ``open_requests`` from a resume payload: still-open server→client
+  /// requests the gateway replays so a reconnecting client re-renders them.
+  static List<ServerRequestEvent> _parseOpenRequests(Object? raw) {
+    if (raw is! List) return const [];
+    final requests = <ServerRequestEvent>[];
+    for (final entry in raw) {
+      if (entry is! Map) continue;
+      final id = entry['id'];
+      final method = entry['method'];
+      final params = entry['params'];
+      if (id is! String ||
+          id.isEmpty ||
+          method is! String ||
+          method.isEmpty ||
+          params is! Map) {
+        continue;
+      }
+      requests.add(
+        ServerRequestEvent(
+          id: id,
+          method: method,
+          params: Map<String, dynamic>.from(params),
+        ),
+      );
+    }
+    return requests;
   }
 
   /// Backward-compatible runtime-id-only resume helper.

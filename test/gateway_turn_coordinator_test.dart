@@ -227,6 +227,11 @@ class _GatewayFixture {
         'created': true,
       };
     }
+    if (method == 'client.capabilities') {
+      return <String, dynamic>{
+        'server_requests': <String>['clarify', 'approval'],
+      };
+    }
     throw StateError('Unexpected synthetic method: $method');
   }
 

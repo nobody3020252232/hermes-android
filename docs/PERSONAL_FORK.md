@@ -15,9 +15,15 @@
 - 同步更新测试：`test/chat_history_scroll_test.dart`（移除 "Spoken replies"、尺寸断言 48→40）。
 - 新增 CI：`Personal APK` workflow（每轮 push 自动出 APK）。
 
+### R2 — 2026-09-30（ask-user-question / clarify 修复）
+- 实现 server→client requests（桌面网关链路，此前完全缺失）：连接后声明 `client.capabilities {server_requests: true}`；分发 `srq-…` 请求帧；clarify 弹窗应答（单问=响应帧 `{answer}`；批量=`clarify.lock`）；处理 `request.cancel`（撤回时静默关闭弹窗）；重连时回放 resume 携带的 `open_requests`。
+- 其他方法（approval/sudo/secret/vault 等）暂时以 -32601 快速拒绝：行为与之前一致（不发送、不挂起），后续轮次再接。
+- 新增测试：`test/gateway_server_requests_test.dart`（真实本地 WS 假网关，覆盖声明、分发、应答、批量锁、重连回放）。
+- 范围说明：仅对"桌面网关（dashboard WS）"连接生效；API server（8642）连接模式下后端本身没有 clarify 通道，不在本轮范围。
+
 ## 待办（用户提出的其余改动）
 
-- R2：界面中文化 + 设置里可切换语言（默认中文）。
-- R3：流式消息滚动行为——停在底部才自动跟随；用户上翻时不打扰。
-- R4：会话历史本地缓存（打开会话不再每次全量拉取）。
-- R5：长任务中"假发送失败"（服务端已接受，APP 却提示失败并回填输入框）修复。
+- R3：界面中文化 + 设置里可切换语言（默认中文）。
+- R4：流式消息滚动行为——停在底部才自动跟随；用户上翻时不打扰。
+- R5：会话历史本地缓存（打开会话不再每次全量拉取）。
+- R6：长任务中"假发送失败"（服务端已接受，APP 却提示失败并回填输入框）修复。

@@ -14,6 +14,8 @@ typedef DesktopAsyncEventCallback =
     void Function(String mobileSessionId, StreamEvent event);
 typedef DesktopConnectionCallback =
     void Function(DesktopConnectionState connectionState);
+typedef DesktopServerRequestCallback =
+    void Function(String mobileSessionId, ServerRequestEvent request);
 
 enum DesktopConnectionState {
   disconnected,
@@ -46,6 +48,7 @@ class DesktopGatewayClient {
   final Map<String, String> _workingDirectories = {};
   DesktopAsyncEventCallback? _asyncEventListener;
   DesktopConnectionCallback? _connectionListener;
+  DesktopServerRequestCallback? _serverRequestListener;
   GatewayTurnCoordinatorRegistry? _turnCoordinatorRegistry;
   ProjectsGatewayClient? _projects;
   final CapabilityRegistry _capabilities = CapabilityRegistry();
@@ -55,6 +58,7 @@ class DesktopGatewayClient {
     'review.summary',
     'notification.show',
     'notification.clear',
+    'request.cancel',
     'subagent.spawn_requested',
     'subagent.start',
     'subagent.thinking',
@@ -261,7 +265,12 @@ class DesktopGatewayClient {
     _capabilities.reset();
     final ticket = await _dashboard.mintWebSocketTicket();
     if (_closed) throw StateError('DesktopGatewayClient is closed.');
-    final client = WsClient(_baseUrl, ticket: ticket, profile: _gatewayProfile);
+    final client = WsClient(
+      _baseUrl,
+      ticket: ticket,
+      profile: _gatewayProfile,
+      advertiseServerRequests: true,
+    );
     _installAsyncEventBridge(client);
     client.onConnectionChanged = (connected) {
       if (connected) {
@@ -443,6 +452,16 @@ class DesktopGatewayClient {
         );
       });
     }
+    final openRequests = resumed?.openRequests ?? const <ServerRequestEvent>[];
+    if (openRequests.isNotEmpty) {
+      // Binding maps are authoritative now; replay the still-open prompts the
+      // gateway is holding for this session (closes the reconnect gap).
+      scheduleMicrotask(() {
+        for (final request in openRequests) {
+          _handleServerRequest(request);
+        }
+      });
+    }
   }
 
   /// The gateway's stored session key bound to a mobile session id, when a
@@ -557,7 +576,16 @@ class DesktopGatewayClient {
       journal: journal ?? GatewayTurnJournal(),
       freshSocketFactory: () async {
         final ticket = await _dashboard.mintWebSocketTicket();
-        return WsClient(_baseUrl, ticket: ticket, profile: _gatewayProfile);
+        final client = WsClient(
+          _baseUrl,
+          ticket: ticket,
+          profile: _gatewayProfile,
+          advertiseServerRequests: true,
+        );
+        // Recovery sockets are peers on the same sessions: they must route
+        // prompts to the screen too, never auto-decline them.
+        client.onServerRequest = _handleServerRequest;
+        return client;
       },
     );
   }
@@ -608,10 +636,19 @@ class DesktopGatewayClient {
     _asyncEventListener = listener;
   }
 
+  /// Receives server→client requests (clarify …) for sessions this client
+  /// serves. The listener owns the answer; unclaimed requests are declined.
+  void setServerRequestListener(DesktopServerRequestCallback? listener) {
+    _serverRequestListener = listener;
+  }
+
   void _installAsyncEventBridge(WsClient client) {
     // Every socket greets us with gateway.ready; that greeting is where the
     // capability registry learns what this Hermes instance offers.
     _capabilities.bindTo(client);
+    // Server→client requests (clarify …) on this socket route to the screen
+    // bound to the request's session.
+    client.onServerRequest = _handleServerRequest;
     client.onStreamEvent = (event) {
       if (!_asyncEventTypes.contains(event.type)) return;
       final gatewaySessionId = event.data['session_id']?.toString();
@@ -683,6 +720,81 @@ class DesktopGatewayClient {
       answer: answer,
       questionId: questionId,
     );
+  }
+
+  /// Routes one server→client request (clarify/approval …) to the screen
+  /// bound to its session. Unmapped or unclaimed requests are declined with
+  /// -32601 so the agent fails fast instead of waiting for a deadline.
+  void _handleServerRequest(ServerRequestEvent request) {
+    final gatewaySessionId = request.params['session_id']?.toString();
+    String? mobileSessionId;
+    if (gatewaySessionId != null && gatewaySessionId.isNotEmpty) {
+      for (final entry in _gatewaySessionIds.entries) {
+        if (entry.value == gatewaySessionId) {
+          mobileSessionId = entry.key;
+          break;
+        }
+      }
+    } else if (_gatewaySessionIds.length == 1) {
+      mobileSessionId = _gatewaySessionIds.keys.single;
+    }
+    final listener = _serverRequestListener;
+    if (mobileSessionId == null || listener == null) {
+      _ws?.sendServerRequestResponse(
+        request.id,
+        errorCode: -32601,
+        errorMessage: 'No active client handler',
+      );
+      return;
+    }
+    listener(mobileSessionId, request);
+  }
+
+  /// Answers a server→client request with a result payload (response frame).
+  Future<void> respondToServerRequest(
+    String requestId,
+    Map<String, dynamic> result,
+  ) async {
+    _connectedClient().sendServerRequestResponse(requestId, result: result);
+  }
+
+  /// Declines a server→client request this build does not implement (-32601,
+  /// so the backend withdraws it instead of waiting for its deadline).
+  Future<void> rejectServerRequest(
+    String requestId, {
+    int code = -32601,
+    String message = 'Method not implemented',
+  }) async {
+    _connectedClient().sendServerRequestResponse(
+      requestId,
+      errorCode: code,
+      errorMessage: message,
+    );
+  }
+
+  /// Locks one batch-clarify answer; the gateway resolves the request on the
+  /// last lock. Re-locking a question overwrites until every question is
+  /// locked.
+  Future<void> lockClarifyAnswer({
+    required String requestId,
+    required String questionId,
+    required String answer,
+  }) async {
+    final client = _connectedClient();
+    final response = await client.send('clarify.lock', {
+      'request_id': requestId,
+      'question_id': questionId,
+      'answer': answer,
+    });
+    final error = response['error'];
+    if (error != null) {
+      throw JsonRpcError(
+        'clarify.lock',
+        error is Map && error['message'] != null
+            ? error['message'].toString()
+            : 'Gateway clarification failed',
+      );
+    }
   }
 
   WsClient _connectedClient() {
