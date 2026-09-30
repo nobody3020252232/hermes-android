@@ -19,14 +19,15 @@ class ChatReasoningItem {
 /// - `Map<String, dynamic>` — a user or assistant bubble, carrying
 ///   `_display_content` (tool-result blocks stripped) and, for assistant
 ///   replies, `_retry_prompt` with the user prompt that caused it;
-/// - `List<GatewayToolActivity>` — consecutive tool results collapsed into one
-///   activity card;
+/// - `List<GatewayToolActivity>` — a **failed** tool only: passing tools are
+///   not rendered at all (the phone shows the answer, not a breadcrumb list),
+///   and [verbose] restores the full per-call list for debugging;
 /// - [ChatReasoningItem] — assistant reasoning, emitted before its bubble;
 /// - `GatewaySubagentActivity` list and [GatewayNotice] — appended last.
 ///
 /// Tool results are matched positionally against [toolActivities]: stored tool
 /// messages consume activities in order, and any activity left over (streamed
-/// but not yet persisted by the server) is appended as a trailing card. The
+/// but not yet persisted by the server) is considered for a trailing item. The
 /// caller's [toolActivities] list is never mutated.
 List<dynamic> buildChatDisplayItems({
   required List<Map<String, dynamic>> messages,
@@ -40,9 +41,23 @@ List<dynamic> buildChatDisplayItems({
   final currentGroup = <GatewayToolActivity>[];
   String? lastUserPrompt;
 
+  // Tool activity is chrome: a group renders only its failures (the one thing
+  // the final answer usually does not say), or everything in verbose mode.
+  void emitToolGroup(List<GatewayToolActivity> group) {
+    if (group.isEmpty) return;
+    if (verbose) {
+      displayItems.add(group);
+      return;
+    }
+    final failures = group
+        .where((activity) => activity.isFailed)
+        .toList(growable: false);
+    if (failures.isNotEmpty) displayItems.add(failures);
+  }
+
   void flushToolGroup() {
     if (currentGroup.isEmpty) return;
-    displayItems.add(currentGroup.toList());
+    emitToolGroup(currentGroup.toList());
     currentGroup.clear();
   }
 
@@ -84,8 +99,8 @@ List<dynamic> buildChatDisplayItems({
   flushToolGroup();
 
   // Tools from gateway events that arrived during streaming but were never
-  // matched to a stored message — show them as a trailing card.
-  if (toolQueue.isNotEmpty) displayItems.add(toolQueue.toList());
+  // matched to a stored message — same failure-only rule as a flushed group.
+  emitToolGroup(toolQueue);
   if (subagentActivities.isNotEmpty) {
     displayItems.add(List<GatewaySubagentActivity>.from(subagentActivities));
   }

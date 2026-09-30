@@ -34,8 +34,18 @@ class _GatewayActivityCardState extends State<GatewayActivityCard> {
     final activities = widget.activities;
     final active = activities.any((activity) => !activity.isTerminal);
     final failures = activities.where((activity) => activity.isFailed).length;
+    // A failure-only group (what the phone shows by default) leads with the
+    // failing tool instead of a generic card title.
+    final onlyFailures = failures > 0 && failures == activities.length;
+    final singleFailure = onlyFailures && failures == 1;
     final subtitle = active
         ? 'Hermes is using ${activities.length == 1 ? 'a tool' : '${activities.length} tools'}'
+        : onlyFailures
+        ? (singleFailure
+              ? (activities.first.durationSeconds == null
+                    ? ''
+                    : activities.first.statusLabel)
+              : activities.map((activity) => activity.displayName).join(', '))
         : failures > 0
         ? '$failures failed • ${activities.length} total'
         : '${activities.length} completed';
@@ -45,6 +55,12 @@ class _GatewayActivityCardState extends State<GatewayActivityCard> {
         : failures > 0
         ? HermesStatus.failed
         : HermesStatus.completed;
+
+    final title = onlyFailures
+        ? (failures == 1
+              ? '${activities.first.displayName} failed'
+              : '$failures tools failed')
+        : 'Tool activity';
 
     return Padding(
       padding: const EdgeInsets.symmetric(
@@ -78,8 +94,14 @@ class _GatewayActivityCardState extends State<GatewayActivityCard> {
                           ? Theme.of(context).colorScheme.error
                           : Theme.of(context).colorScheme.primary,
                     ),
-              title: const Text('Tool activity'),
-              subtitle: Text(subtitle),
+              title: Text(title),
+              subtitle: subtitle.isEmpty
+                  ? null
+                  : Text(
+                      subtitle,
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                    ),
               children: [
                 const Divider(height: 1),
                 for (final activity in activities)

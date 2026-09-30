@@ -75,10 +75,49 @@ void main() {
       ),
     ]);
 
-    expect(find.text('1 failed • 1 total'), findsOneWidget);
-    await tester.tap(find.text('Tool activity'));
-    await tester.pumpAndSettle();
+    // A failure-only card leads with the failing tool, not a card title.
+    expect(find.text('Terminal failed'), findsOneWidget);
     expect(find.text('Failed after 2.0 s'), findsOneWidget);
+    await tester.tap(find.text('Terminal failed'));
+    await tester.pumpAndSettle();
+    expect(find.text('Command failed'), findsOneWidget);
+    expect(find.text('Failed after 2.0 s'), findsWidgets);
+  });
+
+  testWidgets('a failure-only group counts the tools instead of naming one', (
+    tester,
+  ) async {
+    await _pump(tester, const [
+      GatewayToolActivity(
+        name: 'terminal',
+        phase: GatewayToolActivityPhase.failed,
+      ),
+      GatewayToolActivity(
+        name: 'read_file',
+        phase: GatewayToolActivityPhase.failed,
+      ),
+    ]);
+
+    expect(find.text('2 tools failed'), findsOneWidget);
+    expect(find.text('Terminal, Read file'), findsOneWidget);
+  });
+
+  testWidgets('a mixed group keeps the generic title and the tally', (
+    tester,
+  ) async {
+    await _pump(tester, const [
+      GatewayToolActivity(
+        name: 'terminal',
+        phase: GatewayToolActivityPhase.failed,
+      ),
+      GatewayToolActivity(
+        name: 'read_file',
+        phase: GatewayToolActivityPhase.completed,
+      ),
+    ]);
+
+    expect(find.text('Tool activity'), findsOneWidget);
+    expect(find.text('1 failed • 2 total'), findsOneWidget);
   });
 
   testWidgets('survives large text without overflow', (tester) async {

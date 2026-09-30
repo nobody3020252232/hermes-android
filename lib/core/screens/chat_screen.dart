@@ -3709,6 +3709,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
           itemBuilder: (context, index) {
             final item = displayMessages[index];
 
+            // buildChatDisplayItems only emits tool groups for failures (or in
+            // verbose mode) — the card never lists passing tools.
             if (item is List<GatewayToolActivity>) {
               return GatewayActivityCard(
                 activities: item,

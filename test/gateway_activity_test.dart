@@ -155,8 +155,8 @@ void main() {
       );
       await tester.pump(const Duration(milliseconds: 300));
 
-      expect(find.text('1 failed • 1 total'), findsOneWidget);
-      expect(find.textContaining('Terminal'), findsOneWidget);
+      expect(find.text('Terminal failed'), findsOneWidget);
+      expect(find.text('💻 Terminal'), findsOneWidget);
       expect(find.text('Failed'), findsOneWidget);
       expect(find.text('Synthetic command failed'), findsOneWidget);
     });

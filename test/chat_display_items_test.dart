@@ -6,6 +6,13 @@ import 'package:hermes_android/core/utils/chat_display_items.dart';
 GatewayToolActivity _tool(String name) =>
     GatewayToolActivity(name: name, phase: GatewayToolActivityPhase.completed);
 
+GatewayToolActivity _failedTool(String name, [String? detail]) =>
+    GatewayToolActivity(
+      name: name,
+      phase: GatewayToolActivityPhase.failed,
+      detail: detail,
+    );
+
 GatewaySubagentActivity _subagent(String id) => GatewaySubagentActivity(
   id: id,
   goal: 'goal $id',
@@ -108,7 +115,7 @@ void main() {
       );
     });
 
-    test('replaces a tool result message with the matching activity card', () {
+    test('hides a passing tool result behind the answer, with no card', () {
       final items = buildChatDisplayItems(
         messages: [
           {'role': 'user', 'content': 'run it'},
@@ -118,14 +125,12 @@ void main() {
         toolActivities: [_tool('terminal')],
       );
 
-      expect(items, hasLength(3));
-      expect(items[0], isA<Map<String, dynamic>>());
-      final group = items[1] as List<GatewayToolActivity>;
-      expect(group.map((activity) => activity.name), ['terminal']);
-      expect((items[2] as Map<String, dynamic>)['_display_content'], 'done');
+      expect(items, hasLength(2));
+      expect((items[0] as Map<String, dynamic>)['role'], 'user');
+      expect((items[1] as Map<String, dynamic>)['_display_content'], 'done');
     });
 
-    test('groups consecutive tool results into a single card', () {
+    test('never lists a group of passing tools', () {
       final items = buildChatDisplayItems(
         messages: [
           {'role': 'tool', 'content': 'first'},
@@ -135,11 +140,48 @@ void main() {
         toolActivities: [_tool('read_file'), _tool('write_file')],
       );
 
+      expect(items, hasLength(1));
+      expect(items.single, isA<Map<String, dynamic>>());
+    });
+
+    test('shows only the failed tools of a mixed group', () {
+      final items = buildChatDisplayItems(
+        messages: [
+          {'role': 'tool', 'content': 'ok'},
+          {'role': 'tool', 'content': 'boom'},
+          {'role': 'tool', 'content': 'ok'},
+          {'role': 'assistant', 'content': 'done'},
+        ],
+        toolActivities: [
+          _tool('read_file'),
+          _failedTool('terminal', 'exit 1'),
+          _tool('patch'),
+        ],
+      );
+
+      expect(items, hasLength(2));
+      final group = items[0] as List<GatewayToolActivity>;
+      expect(group.map((activity) => activity.name), ['terminal']);
+      expect(group.single.detail, 'exit 1');
+      expect((items[1] as Map<String, dynamic>)['_display_content'], 'done');
+    });
+
+    test('verbose restores the full tool list', () {
+      final items = buildChatDisplayItems(
+        messages: [
+          {'role': 'tool', 'content': 'first'},
+          {'role': 'tool', 'content': 'second'},
+          {'role': 'assistant', 'content': 'done'},
+        ],
+        toolActivities: [_tool('read_file'), _failedTool('terminal')],
+        verbose: true,
+      );
+
       expect(items, hasLength(2));
       final group = items[0] as List<GatewayToolActivity>;
       expect(group.map((activity) => activity.name), [
         'read_file',
-        'write_file',
+        'terminal',
       ]);
     });
 
@@ -161,7 +203,23 @@ void main() {
       },
     );
 
-    test('appends tool activities that never matched a stored message', () {
+    test('appends a streamed failure that never matched a stored message', () {
+      final items = buildChatDisplayItems(
+        messages: [
+          {'role': 'assistant', 'content': 'streaming'},
+        ],
+        toolActivities: [_tool('search_files'), _failedTool('terminal')],
+      );
+
+      expect(items, hasLength(2));
+      expect(items[0], isA<Map<String, dynamic>>());
+      expect(
+        (items[1] as List<GatewayToolActivity>).single.name,
+        'terminal',
+      );
+    });
+
+    test('drops streamed activities that never matched and never failed', () {
       final items = buildChatDisplayItems(
         messages: [
           {'role': 'assistant', 'content': 'streaming'},
@@ -169,12 +227,9 @@ void main() {
         toolActivities: [_tool('search_files')],
       );
 
-      expect(items, hasLength(2));
-      expect(items[0], isA<Map<String, dynamic>>());
-      expect(
-        (items[1] as List<GatewayToolActivity>).single.name,
-        'search_files',
-      );
+      expect(items, hasLength(1));
+      expect((items.single as Map<String, dynamic>)['_display_content'],
+          'streaming');
     });
 
     test('leaves the caller list untouched while consuming activities', () {
@@ -206,11 +261,9 @@ void main() {
         toolActivities: [_tool('terminal')],
       );
 
-      expect(items, hasLength(1));
-      expect(
-        (items.single as List<GatewayToolActivity>).single.name,
-        'terminal',
-      );
+      // The embedded block still swallows the prose; the consumed activity is
+      // passing, so no card replaces it.
+      expect(items, isEmpty);
     });
 
     test(
@@ -307,7 +360,7 @@ void main() {
       expect((items[0] as ChatReasoningItem).initiallyExpanded, isTrue);
     });
 
-    test('flushes a pending tool card before a reasoning item', () {
+    test('flushes a pending tool group before a reasoning item', () {
       final items = buildChatDisplayItems(
         messages: [
           {'role': 'tool', 'content': 'output'},
@@ -317,7 +370,7 @@ void main() {
             '_gateway_reasoning': 'thinking',
           },
         ],
-        toolActivities: [_tool('terminal')],
+        toolActivities: [_failedTool('terminal')],
       );
 
       expect(items[0], isA<List<GatewayToolActivity>>());

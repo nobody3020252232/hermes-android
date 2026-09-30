@@ -21,6 +21,15 @@
 - 新增测试：`test/gateway_server_requests_test.dart`（真实本地 WS 假网关，覆盖声明、分发、应答、批量锁、重连回放）。
 - 范围说明：仅对"桌面网关（dashboard WS）"连接生效；API server（8642）连接模式下后端本身没有 clarify 通道，不在本轮范围。
 
+### R7 — 2026-10-01（手机端不再显示工具调用卡片）
+- 起因：实测确认"工具名列表"在手机上是纯噪音——`~/.hermes/state.db` 里 tool 行占全部消息的 **56%**，一个会话产出上百张卡片，其中 **63% 只有一次工具调用**；而历史上这些行只显示"名字 + Completed"（app 的 `_extractToolMessages` 丢掉服务端已下发的 `context`/`args`）。真正有信息的只有失败的调用（约 4%）。
+- 改动（方案C）：`buildChatDisplayItems` 现在**只输出失败的工具**：一组工具里若有失败，只渲染失败行；全部正常则完全不渲染。流式期间未被历史匹配的工具事件同样适用。
+- 失败卡片保留并改成一眼可读：单个失败时标题为"<工具名> failed"（如 `Terminal failed`），有耗时时副标题给出"Failed after 2.0 s"；多个失败时标题"N tools failed"、副标题列出工具名。
+- 逃生口：设置里的 **Verbose Mode**（原文案"Show tool calls, thinking, and message metadata"）恢复完整工具列表，无需新增开关。
+- 未变：实时进度仍由输入框上方的状态条承担（"Using Read File…"）；最终回答不变。
+- 测试：`test/chat_display_items_test.dart`（改为断言"正常工具不渲染/混合组只留失败/verbose 恢复"）、`test/gateway_activity_card_test.dart`、`test/gateway_activity_test.dart`（失败卡片新文案）。全套 1069 个测试通过，`flutter analyze` 0 issue。
+- 已知边界：失败信息只来自实时事件，历史接口不下发状态字段，因此**重新打开会话后失败卡片不会重建**（本轮不为此改服务端）。
+
 ## 待办（用户提出的其余改动）
 
 - R3：界面中文化 + 设置里可切换语言（默认中文）。
