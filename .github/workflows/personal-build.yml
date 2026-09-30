@@ -1,0 +1,72 @@
+name: Personal APK
+
+# 个人 fork：每次 push 到 main 自动构建可安装的 APK，便于逐轮安装验收与留档。
+# 签名使用 repo secrets 里的个人密钥（PERSONAL_*）；缺少密钥时退回 debug 构建。
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build personal APK
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.44.0'
+          channel: 'stable'
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      - name: Configure personal signing
+        env:
+          KEYSTORE_BASE64: ${{ secrets.PERSONAL_KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.PERSONAL_STORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.PERSONAL_KEY_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.PERSONAL_KEY_ALIAS }}
+        run: |
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            echo "$KEYSTORE_BASE64" | base64 -d > release.keystore
+            printf 'storePassword=%s\nkeyPassword=%s\nkeyAlias=%s\nstoreFile=%s/release.keystore\n' \
+              "$STORE_PASSWORD" "$KEY_PASSWORD" "$KEY_ALIAS" "$GITHUB_WORKSPACE" > key.properties
+          fi
+
+      - name: Build APK
+        run: |
+          if [ -f key.properties ]; then
+            echo "Building signed release APK"
+            flutter build apk --release
+            SRC=build/app/outputs/flutter-apk/app-release.apk
+          else
+            echo "No keystore secrets; building debug APK instead"
+            flutter build apk --debug
+            SRC=build/app/outputs/flutter-apk/app-debug.apk
+          fi
+          SHORT_SHA=$(echo "$GITHUB_SHA" | cut -c1-7)
+          mkdir -p out
+          cp "$SRC" "out/hermes-personal-${SHORT_SHA}-run${GITHUB_RUN_NUMBER}.apk"
+          ls -lh out
+
+      - name: Record checksum
+        run: sha256sum out/*.apk | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hermes-personal-apk-${{ github.run_number }}
+          path: out/*.apk
+          retention-days: 180
