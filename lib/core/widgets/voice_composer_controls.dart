@@ -124,10 +124,10 @@ class VoiceComposerStartButton extends StatelessWidget {
       enabled: enabled,
       excludeSemantics: true,
       child: IconButton.filledTonal(
-        icon: const Icon(Icons.mic),
+        icon: const Icon(Icons.mic, size: 20),
         onPressed: enabled ? onPressed : null,
         tooltip: 'Speak to Hermes',
-        constraints: const BoxConstraints.tightFor(width: 48, height: 48),
+        constraints: const BoxConstraints.tightFor(width: 40, height: 40),
       ),
     );
   }

@@ -317,7 +317,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   // Voice input / spoken replies
   final FlutterTts _flutterTts = FlutterTts();
   late final VoiceComposerController _voiceComposer;
-  bool _voiceReplyEnabled = true;
+  final bool _voiceReplyEnabled = true;
   bool _awaitingVoiceReply = false;
   String? _voiceStatus;
   String? _sttLocaleId;
@@ -3149,17 +3149,26 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
           overflow: TextOverflow.ellipsis,
           style: Theme.of(context).textTheme.titleMedium,
         ),
-        bottom: PreferredSize(
-          preferredSize: const Size.fromHeight(48),
-          child: ChatContextHeader(
-            projectName: widget.projectName,
-            model: _sessionModel ?? widget.session.model,
-            reasoningEffort: _sessionReasoningEffort ?? 'default',
-            connectionLabel: widget.connection.label,
-            connectionStatus: _chatConnectionStatus,
-          ),
-        ),
         actions: [
+          if (_chatConnectionStatus != ChatConnectionStatus.connected)
+            Padding(
+              padding: const EdgeInsets.only(right: 6),
+              child: Tooltip(
+                message:
+                    '${widget.connection.label} • ${_chatConnectionStatus.label}',
+                child: Icon(
+                  Icons.circle,
+                  size: 10,
+                  color: switch (_chatConnectionStatus) {
+                    ChatConnectionStatus.connected => Colors.green,
+                    ChatConnectionStatus.connecting => Colors.orange,
+                    ChatConnectionStatus.reconnecting => Colors.orange,
+                    ChatConnectionStatus.offline =>
+                      Theme.of(context).colorScheme.error,
+                  },
+                ),
+              ),
+            ),
           if (_streaming)
             const Padding(
               padding: EdgeInsets.only(right: 8),
@@ -3285,7 +3294,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   Widget _buildInputBar() {
     return Container(
       key: const Key('chat-input-bar'),
-      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
       decoration: BoxDecoration(
         color: Theme.of(context).colorScheme.surface,
         boxShadow: [
@@ -3426,7 +3435,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                       !_pendingReattachResync,
                   excludeSemantics: true,
                   child: IconButton(
-                    icon: const Icon(Icons.attach_file),
+                    icon: const Icon(Icons.attach_file, size: 20),
                     onPressed:
                         (!_loading &&
                             !_streaming &&
@@ -3436,8 +3445,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                         : null,
                     tooltip: 'Attach image or file',
                     constraints: const BoxConstraints.tightFor(
-                      width: 48,
-                      height: 48,
+                      width: 40,
+                      height: 40,
                     ),
                   ),
                 ),
@@ -3454,7 +3463,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                           borderRadius: BorderRadius.circular(24),
                         ),
                         contentPadding: const EdgeInsets.symmetric(
-                          horizontal: 16,
+                          horizontal: 12,
                           vertical: 8,
                         ),
                         isDense: true,
@@ -3470,7 +3479,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                     ),
                   ),
                 ),
-                const SizedBox(width: 8),
+                const SizedBox(width: 4),
                 if (!_voiceComposer.listening)
                   VoiceComposerStartButton(
                     enabled:
@@ -3480,31 +3489,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                         !_pendingReattachResync,
                     onPressed: _startVoiceInput,
                   ),
-                Semantics(
-                  label: 'Spoken replies',
-                  value: _voiceReplyEnabled ? 'On' : 'Off',
-                  toggled: _voiceReplyEnabled,
-                  button: true,
-                  excludeSemantics: true,
-                  child: IconButton(
-                    icon: Icon(
-                      _voiceReplyEnabled ? Icons.volume_up : Icons.volume_off,
-                    ),
-                    onPressed: () {
-                      setState(() => _voiceReplyEnabled = !_voiceReplyEnabled);
-                      if (!_voiceReplyEnabled) {
-                        _flutterTts.stop();
-                      }
-                    },
-                    tooltip: _voiceReplyEnabled
-                        ? 'Spoken replies on'
-                        : 'Spoken replies off',
-                    constraints: const BoxConstraints.tightFor(
-                      width: 48,
-                      height: 48,
-                    ),
-                  ),
-                ),
                 const SizedBox(width: 4),
                 Semantics(
                   label: _streaming ? 'Stop response' : 'Send message',
@@ -3517,7 +3501,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                           !_voiceComposer.listening),
                   excludeSemantics: true,
                   child: SizedBox.square(
-                    dimension: 48,
+                    dimension: 40,
                     child: DecoratedBox(
                       decoration: BoxDecoration(
                         color: Theme.of(context).colorScheme.primaryContainer,
@@ -3525,16 +3509,16 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                       ),
                       child: _streaming
                           ? IconButton(
-                              icon: const Icon(Icons.stop_rounded, size: 20),
+                              icon: const Icon(Icons.stop_rounded, size: 18),
                               onPressed: _stopResponse,
                               tooltip: 'Stop response',
                               constraints: const BoxConstraints.tightFor(
-                                width: 48,
-                                height: 48,
+                                width: 40,
+                                height: 40,
                               ),
                             )
                           : IconButton(
-                              icon: const Icon(Icons.send, size: 20),
+                              icon: const Icon(Icons.send, size: 18),
                               onPressed:
                                   _loading ||
                                       _sending ||
@@ -3544,8 +3528,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                                   : _sendMessage,
                               tooltip: 'Send',
                               constraints: const BoxConstraints.tightFor(
-                                width: 48,
-                                height: 48,
+                                width: 40,
+                                height: 40,
                               ),
                             ),
                     ),

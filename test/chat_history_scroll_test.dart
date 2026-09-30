@@ -142,7 +142,6 @@ void main() {
             'Add attachment',
             'Message',
             'Start voice input',
-            'Spoken replies',
             'Send message',
           ]) {
             expect(find.bySemanticsLabel(label), findsOneWidget);
@@ -152,7 +151,7 @@ void main() {
             'Speak to Hermes',
             'Send',
           ]) {
-            expect(tester.getSize(find.byTooltip(tooltip)), const Size(48, 48));
+            expect(tester.getSize(find.byTooltip(tooltip)), const Size(40, 40));
           }
           final messageField = tester.widget<TextField>(
             find.descendant(
