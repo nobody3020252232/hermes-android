@@ -85,24 +85,40 @@ void main() {
       expect(history.messageRequestCount, 1);
 
       // PRODUCTION ORDERING: WsClient rejects the pending prompt.submit AT
-      // CLOSE, before any reconnect. The catch restores the composer and
-      // strips the optimistic turn — this happens BEFORE the resync runs.
+      // CLOSE, before any reconnect. The prompt had already reached the wire
+      // (onSent fired), so the app must NOT report a failed send: the turn
+      // stays visible and the composer stays empty until the reply lands.
       history.includeCompletedTurn = true;
       submission.completeError(
         JsonRpcError('prompt.submit', 'Desktop gateway connection closed'),
       );
-      await tester.pump();
-      await tester.pumpAndSettle();
+      await _settlePendingTurn(tester);
+      expect(
+        find.textContaining('Send failed'),
+        findsNothing,
+        reason: 'a lost acknowledgement is not a rejected send',
+      );
+      expect(find.text('Responding…'), findsOneWidget);
+      expect(find.byTooltip('Stop response'), findsOneWidget);
       expect(
         tester.widget<TextField>(find.byType(TextField)).controller!.text,
-        'Long running task',
-        reason:
-            'the catch-at-close path restores the composer before reconnect',
+        '',
+        reason: 'the draft must not come back: the turn may already be running',
+      );
+      expect(
+        tester.widget<TextField>(find.byType(TextField)).enabled,
+        isFalse,
+        reason: 'the composer blocks a duplicate submit while reattaching',
       );
       expect(
         history.messageRequestCount,
         1,
         reason: 'no resync before reconnect',
+      );
+      expect(
+        find.textContaining('will reattach automatically'),
+        findsWidgets,
+        reason: 'the reader is told what is happening',
       );
 
       // The reconnect succeeds: the screen must re-bind and refetch now,
@@ -129,6 +145,16 @@ void main() {
         reason: 'resync must fetch by the stored session identity',
       );
       expect(find.text('Server-side final response'), findsOneWidget);
+
+      // The terminal row landed: the turn whose acknowledgement was lost is
+      // over, so the spinner and the stop control leave the screen.
+      expect(find.text('Responding…'), findsNothing);
+      expect(find.byTooltip('Stop response'), findsNothing);
+      expect(
+        tester.widget<TextField>(find.byType(TextField)).enabled,
+        isTrue,
+        reason: 'the composer is usable again once the turn settles',
+      );
 
       // The reply landed (transcript grew past the pre-resync count), so
       // the resync is done: no further fetches were triggered.
@@ -176,14 +202,14 @@ void main() {
       await tester.pump();
       await tester.pump();
 
-      // Close-ordering: submit fails at close, composer restored.
+      // Close-ordering: submit fails at close. The prompt reached the wire, so
+      // the turn stays pending and the composer stays empty.
       hook.handler?.call(DesktopConnectionState.reconnecting);
       await tester.pump();
       submission.completeError(
         JsonRpcError('prompt.submit', 'Desktop gateway connection closed'),
       );
-      await tester.pump();
-      await tester.pumpAndSettle();
+      await _settlePendingTurn(tester);
 
       // Reconnect: the stored row is NOT readable yet — the first resync
       // fetch 404s. The transcript must survive (never cleared by a
@@ -196,8 +222,8 @@ void main() {
       expect(afterFirstResync, 2, reason: 'first resync fetch attempted');
       expect(
         tester.widget<TextField>(find.byType(TextField)).controller!.text,
-        'Slow settling turn',
-        reason: 'a failed resync must not touch the composer either',
+        '',
+        reason: 'a failed resync must not hand the draft back either',
       );
 
       // The row becomes readable: the next retry must land the reply.
@@ -256,8 +282,7 @@ void main() {
       submission.completeError(
         JsonRpcError('prompt.submit', 'Desktop gateway connection closed'),
       );
-      await tester.pump();
-      await tester.pumpAndSettle();
+      await _settlePendingTurn(tester);
 
       hook.handler?.call(DesktopConnectionState.connected);
       hook.handler?.call(DesktopConnectionState.connected);
@@ -339,8 +364,7 @@ void main() {
       submission.completeError(
         JsonRpcError('prompt.submit', 'Desktop gateway connection closed'),
       );
-      await tester.pump();
-      await tester.pumpAndSettle();
+      await _settlePendingTurn(tester);
 
       hook.handler?.call(DesktopConnectionState.connected);
       await tester.pump();
@@ -443,8 +467,7 @@ void main() {
       submission.completeError(
         JsonRpcError('prompt.submit', 'Desktop gateway connection closed'),
       );
-      await tester.pump();
-      await tester.pumpAndSettle();
+      await _settlePendingTurn(tester);
 
       hook.handler?.call(DesktopConnectionState.connected);
       await tester.pump();
@@ -512,8 +535,7 @@ void main() {
     submission.completeError(
       JsonRpcError('prompt.submit', 'Desktop gateway connection closed'),
     );
-    await tester.pump();
-    await tester.pumpAndSettle();
+    await _settlePendingTurn(tester);
 
     hook.handler?.call(DesktopConnectionState.connected);
     await tester.pump();
@@ -590,8 +612,7 @@ void main() {
     submission.completeError(
       JsonRpcError('prompt.submit', 'Desktop gateway connection closed'),
     );
-    await tester.pump();
-    await tester.pumpAndSettle();
+    await _settlePendingTurn(tester);
 
     hook.handler?.call(DesktopConnectionState.connected);
     await tester.pump();
@@ -703,19 +724,24 @@ void main() {
       submission.completeError(
         JsonRpcError('prompt.submit', 'Desktop gateway connection closed'),
       );
-      await tester.pump();
-      await tester.pumpAndSettle();
+      await _settlePendingTurn(tester);
 
       hook.handler?.call(DesktopConnectionState.connected);
       await tester.pump();
       await tester.pump(const Duration(milliseconds: 100));
       expect(history.messageRequestCount, 2);
       expect(asyncHook.handler, isNotNull);
-      final sendButton = find.widgetWithIcon(IconButton, Icons.send);
+      // The turn whose acknowledgement was lost is still pending: the composer
+      // shows the stop control instead of send, and the input stays blocked.
       expect(
-        tester.widget<IconButton>(sendButton).onPressed,
-        isNull,
+        find.byTooltip('Stop response'),
+        findsOneWidget,
         reason: 'reattach recovery must still be pending before the failure',
+      );
+      expect(
+        tester.widget<TextField>(find.byType(TextField)).enabled,
+        isFalse,
+        reason: 'the composer blocks a duplicate submit while reattaching',
       );
       expect(
         tester
@@ -724,18 +750,11 @@ void main() {
         isNull,
         reason: 'model changes must not race the authoritative history fetch',
       );
-      await tester.tap(find.byTooltip('Chat actions'));
-      await tester.pumpAndSettle();
-      final refreshItem = find.ancestor(
-        of: find.text('Refresh'),
-        matching: find.byType(PopupMenuItem<String>),
-      );
-      expect(
-        tester.widget<PopupMenuItem<String>>(refreshItem).enabled,
-        isFalse,
-      );
-      await tester.tapAt(Offset.zero);
-      await tester.pumpAndSettle();
+      // While the lost turn is pending the header shows the spinner instead of
+      // the chat-actions menu, so a manual refresh cannot race the
+      // authoritative history fetch.
+      expect(find.byTooltip('Chat actions'), findsNothing);
+      expect(find.text('Responding…'), findsOneWidget);
 
       asyncHook.handler?.call(
         StreamEvent(
@@ -746,9 +765,16 @@ void main() {
       );
       await tester.pump();
       expect(
-        tester.widget<IconButton>(sendButton).onPressed,
-        isNotNull,
+        tester.widget<TextField>(find.byType(TextField)).enabled,
+        isTrue,
         reason: 'terminal failure must clear reattach recovery',
+      );
+      expect(
+        tester
+            .widget<IconButton>(find.widgetWithIcon(IconButton, Icons.send))
+            .onPressed,
+        isNotNull,
+        reason: 'terminal failure must hand the composer back',
       );
 
       final settledCount = history.messageRequestCount;
@@ -944,6 +970,13 @@ void main() {
     expect(ensureCount, 0);
     expect(history.messageRequestCount, 1);
   });
+}
+
+/// A turn whose acknowledgement was lost keeps a spinner on screen, so
+/// `pumpAndSettle` never settles: advance fixed frames instead.
+Future<void> _settlePendingTurn(WidgetTester tester) async {
+  await tester.pump();
+  await tester.pump(const Duration(milliseconds: 100));
 }
 
 Future<void> _pumpChat(

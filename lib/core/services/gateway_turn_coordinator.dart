@@ -1724,13 +1724,27 @@ bool _canonicalPersistedUuid(String value) =>
 
 bool _ambiguousJsonRpcFailure(JsonRpcError error) {
   if (error.message == 'Timeout') return true;
-  return const <String>{
+  if (const <String>{
     'connection_closed',
     'transport_closed',
     'transport_error',
     'websocket_error',
     'socket_error',
-  }.contains(error.reason);
+  }.contains(error.reason)) {
+    return true;
+  }
+  // A transport failure can reach the client with only a message (the socket
+  // died before the server answered, or a different subsystem's RPC failed for
+  // the same reason). Never read that as an authoritative rejection: the
+  // prompt's fate is undecided, and reconciling is cheaper than guessing.
+  final message = error.message.toLowerCase();
+  return const <String>[
+    'connection closed',
+    'connection lost',
+    'transport closed',
+    'socket closed',
+    'websocket closed',
+  ].any(message.contains);
 }
 
 /// Whether the gateway returned an authoritative rejection rather than an

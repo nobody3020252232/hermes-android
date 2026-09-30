@@ -34,6 +34,7 @@ import '../models/gateway_sensitive_prompt.dart';
 import '../models/gateway_turn_contract.dart';
 import '../utils/chat_display_items.dart';
 import '../utils/chat_history_scroll.dart';
+import '../utils/send_delivery.dart';
 import '../utils/message_content.dart';
 import '../utils/responsive.dart';
 import '../utils/turn_recovery_fallback.dart';
@@ -297,6 +298,13 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   /// The server keeps the turn running detached, so authoritative history is
   /// polled until a terminal row beyond the pre-submit durable ID appears.
   bool _pendingReattachResync = false;
+  /// True when the pending reattach came from a submit whose acknowledgement
+  /// was lost: the local turn must stay visible ("Responding…" + stop button)
+  /// until its terminal row lands.
+  bool _pendingReattachTurnFromSubmit = false;
+  /// Set in dispose(): the reattach bookkeeping runs there too, and setState is
+  /// illegal once the element is defunct.
+  bool _disposed = false;
   bool _reattachResyncing = false;
   bool _reattachImmediateRetryRequested = false;
   bool _legacyDesktopPromptSubmitted = false;
@@ -465,6 +473,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
 
   @override
   void dispose() {
+    _disposed = true;
     WidgetsBinding.instance.removeObserver(this);
     _clearPendingReattachResync();
     widget.testDesktopConnectionHook?.handler = null;
@@ -1075,6 +1084,34 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     _reattachLegacyTerminalWatermark = 0;
     _reattachRetryAttempt = 0;
     _reattachGeneration += 1;
+    if (!_pendingReattachTurnFromSubmit) return;
+    // The turn whose acknowledgement was lost now has its terminal row: the
+    // reader's turn is over, so leave the streaming state instead of holding
+    // "Responding…" (and the stop button) for a finished turn.
+    _pendingReattachTurnFromSubmit = false;
+    _turnSettledAfterLostAcknowledgement();
+  }
+
+  void _turnSettledAfterLostAcknowledgement() {
+    void settle() {
+      if (_messages.isNotEmpty &&
+          _messages.last['role'] == 'assistant' &&
+          (_messages.last['content']?.toString().isEmpty ?? true)) {
+        _messages.removeLast();
+      }
+      _sending = false;
+      _streaming = false;
+      _awaitingVoiceReply = false;
+      _activeResponseTransport = _ResponseTransport.none;
+      _gatewayTurnStatus = null;
+    }
+
+    // Reached from dispose() too, where setState is not allowed.
+    if (!mounted || _disposed) {
+      settle();
+      return;
+    }
+    setState(settle);
   }
 
   bool get _canRunReattachResync =>
@@ -1082,6 +1119,29 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       _pendingReattachResync &&
       !_appInBackground &&
       _desktopConnectionState == DesktopConnectionState.connected;
+
+  /// Whether the streaming placeholder already carries text: proof that the
+  /// server accepted and ran this turn, whatever the socket does next.
+  bool _streamedAssistantContent() {
+    for (var index = _messages.length - 1; index >= 0; index--) {
+      final message = _messages[index];
+      if (message['role'] != 'assistant') continue;
+      return message['content']?.toString().isNotEmpty ?? false;
+    }
+    return false;
+  }
+
+  /// Completed assistant answers already in the transcript, row ids or not.
+  /// Used as the watermark for a transport drop on a non-durable transport.
+  static int _terminalAssistantCount(
+    Iterable<Map<String, dynamic>> messages,
+  ) => messages
+      .where(
+        (message) =>
+            _isTerminalAssistant(message) &&
+            (message['content']?.toString().isNotEmpty ?? false),
+      )
+      .length;
 
   Duration _nextReattachRetryDelay() {
     var milliseconds = _reattachRetryBaseDelay.inMilliseconds;
@@ -1196,6 +1256,71 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     } finally {
       _legacyHistoryResyncing = false;
     }
+  }
+
+  /// The SSE transport cannot reattach to a live run, but the API server
+  /// persists the reply either way: poll the session history until it lands
+  /// instead of telling the reader the send failed. Bounded; never resubmits.
+  static const _transportDropHistoryAttempts = 8;
+
+  static Duration _transportDropHistoryDelay(int attempt) {
+    final seconds = 3 * (attempt + 1);
+    return Duration(seconds: seconds > 12 ? 12 : seconds);
+  }
+
+  Future<void> _awaitRestTurnAfterTransportDrop(
+    int generation,
+    int historyWatermark,
+  ) async {
+    setState(() {
+      _gatewayTurnStatus = const GatewayTurnStatus(
+        kind: 'transport',
+        text: 'Connection lost — waiting for Hermes to finish…',
+      );
+    });
+
+    for (var attempt = 0; attempt < _transportDropHistoryAttempts; attempt++) {
+      await Future<void>.delayed(_transportDropHistoryDelay(attempt));
+      if (!mounted || generation != _responseGeneration) return;
+      List<Map<String, dynamic>> messages;
+      try {
+        messages = await _client.getMessages(widget.session.id);
+      } catch (_) {
+        // The transport is still down; the next attempt retries.
+        continue;
+      }
+      if (!mounted || generation != _responseGeneration) return;
+      if (_terminalAssistantCount(messages) <= historyWatermark) continue;
+
+      _extractToolMessages(messages);
+      setState(() {
+        _messages = messages;
+        _historyGeneration += 1;
+        _streaming = false;
+        _sending = false;
+        _awaitingVoiceReply = false;
+        _activeResponseTransport = _ResponseTransport.none;
+        _gatewayTurnStatus = null;
+      });
+      _scheduleScrollTarget(_scrollCoordinator.endStreaming());
+      return;
+    }
+
+    // Nothing landed inside the budget. Stop claiming a live turn, but keep
+    // the reader's prompt in the transcript and out of the composer: the
+    // server may still be finishing, and a refilled draft invites a duplicate.
+    if (!mounted || generation != _responseGeneration) return;
+    _scrollCoordinator.cancelStreaming();
+    setState(() {
+      _streaming = false;
+      _sending = false;
+      _activeResponseTransport = _ResponseTransport.none;
+      _gatewayTurnStatus = const GatewayTurnStatus(
+        kind: 'transport_lost',
+        text:
+            'Connection lost. Hermes may still be finishing — refresh to check.',
+      );
+    });
   }
 
   Future<void> _recoverPendingTurn({bool allowLegacyFallback = false}) async {
@@ -2054,6 +2179,10 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     // The server returns oldest-to-newest history. Preserve that order; the
     // gateway client appends the current prompt exactly once.
     final history = buildRestChatHistory(_messages);
+    // Assistant answers already on screen, counted before the optimistic turn
+    // joins the transcript: the watermark that proves a dropped stream's reply
+    // landed in the server history.
+    final historyWatermark = _terminalAssistantCount(_messages);
     _scrollCoordinator.beginStreaming(isNearEnd: _isNearEnd());
 
     setState(() {
@@ -2146,6 +2275,23 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       },
       onError: (error) {
         if (!mounted || responseGeneration != _responseGeneration) return;
+        if (classifySendDelivery(
+              error,
+              responseStarted: _streamedAssistantContent(),
+            ) ==
+            SendDelivery.uncertain) {
+          // The SSE stream died mid-turn. The API server owns the run from the
+          // moment the request was accepted, so reporting a failed send (and
+          // handing the draft back) invites a duplicate resend of work that is
+          // already happening. Keep the turn and wait for the reply to land.
+          unawaited(
+            _awaitRestTurnAfterTransportDrop(
+              responseGeneration,
+              historyWatermark,
+            ),
+          );
+          return;
+        }
         // Remove the placeholder assistant message
         setState(() {
           if (_messages.isNotEmpty && _messages.last['role'] == 'assistant') {
@@ -2185,6 +2331,10 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     final historyAtSend = _historyGeneration;
     _activeResponseTransport = _ResponseTransport.desktop;
     var turnAdded = false;
+    // The transport's own wire-send signal: distinguishes a socket that died
+    // before the prompt frame went out (nothing submitted — restore the draft)
+    // from one that died after it (the server may own the turn).
+    var promptReachedWire = false;
 
     setState(() {
       _sending = true;
@@ -2267,6 +2417,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
           void markPromptSent() {
             if (mounted && responseGeneration == _responseGeneration) {
               _legacyDesktopPromptSubmitted = true;
+              promptReachedWire = true;
             }
           }
 
@@ -2318,6 +2469,38 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       // reply). Restoring the composer and stripping the local turn would
       // clobber it, so skip the restore and just surface the error state.
       final resyncLanded = _historyGeneration != historyAtSend;
+      if (!resyncLanded &&
+          classifySendDelivery(
+                error,
+                responseStarted: _streamedAssistantContent(),
+                deliveryStarted: promptReachedWire,
+              ) ==
+              SendDelivery.uncertain) {
+        // The socket died with the prompt in flight. A client disconnect does
+        // not cancel a server turn, and the gateway rejects the pending RPC at
+        // close before any reconnect — so "Send failed" here is a claim the
+        // transport cannot make. Keep the turn visible and let the reattach
+        // resync deliver the reply; the composer stays blocked against a
+        // duplicate submit.
+        _pendingReattachTurnFromSubmit = true;
+        _markPendingReattachResync();
+        setState(() {
+          _gatewayTurnStatus = const GatewayTurnStatus(
+            kind: 'reattach',
+            text: 'Connection lost — Hermes keeps working; reattaching…',
+          );
+        });
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text(
+              'Connection lost — the running reply continues on the server '
+              'and will reattach automatically.',
+            ),
+            persist: false,
+          ),
+        );
+        return;
+      }
       if (turnAdded && !resyncLanded) {
         setState(() {
           if (_messages.isNotEmpty &&
@@ -3119,6 +3302,10 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     final activeClientTurnId = _activeClientTurnId;
     ++_responseGeneration;
     _scrollCoordinator.cancelStreaming();
+    // The reader is done waiting for a turn whose acknowledgement was lost:
+    // release the composer with it instead of leaving it blocked behind the
+    // reattach retry loop.
+    _clearPendingReattachResync();
     setState(() {
       _streaming = false;
       _sending = false;

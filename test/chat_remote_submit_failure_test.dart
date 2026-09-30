@@ -17,7 +17,8 @@ void main() {
   });
 
   testWidgets(
-    'failed Remote submit restores prompt and three attached drafts without retry',
+    'a Remote submit that reached the wire keeps the turn instead of '
+    'refilling the prompt',
     (tester) async {
       final drafts = [
         _attachedDraft('first', '@file:first-ref'),
@@ -57,16 +58,86 @@ void main() {
         'Retry this prompt\n\n'
         '@file:first-ref\n@file:second-ref\n@file:third-ref',
       );
+      // The prompt reached the wire: claiming a failed send here would invite
+      // a duplicate of work the server may already be doing.
+      expect(find.textContaining('Send failed'), findsNothing);
+      expect(find.text('Responding…'), findsOneWidget);
+      expect(find.byTooltip('Stop response'), findsOneWidget);
+      expect(
+        tester.widget<TextField>(find.byType(TextField)).controller!.text,
+        '',
+        reason: 'the draft must not come back',
+      );
+      expect(
+        tester.widget<TextField>(find.byType(TextField)).enabled,
+        isFalse,
+        reason: 'the composer blocks a duplicate submit while reattaching',
+      );
+      // The attachments went with the prompt, so they are not offered again.
+      expect(find.bySemanticsLabel('Attachment 1 of 3'), findsNothing);
+      expect(find.bySemanticsLabel('Attachment 2 of 3'), findsNothing);
+      expect(find.bySemanticsLabel('Attachment 3 of 3'), findsNothing);
+      expect(
+        drafts.map((draft) => draft.status),
+        everyElement(AttachmentDraftStatus.attached),
+      );
+      expect(drafts.map((draft) => draft.refText), [
+        '@file:first-ref',
+        '@file:second-ref',
+        '@file:third-ref',
+      ]);
+
+      // Nothing is resubmitted while the reader waits for the reply.
+      await tester.pump(const Duration(seconds: 10));
+      expect(submitCount, 1);
+    },
+  );
+
+  testWidgets(
+    'an authoritative rejection still hands the prompt and drafts back',
+    (tester) async {
+      final drafts = [
+        _attachedDraft('first', '@file:first-ref'),
+        _attachedDraft('second', '@file:second-ref'),
+        _attachedDraft('third', '@file:third-ref'),
+      ];
+      var submitCount = 0;
+      String? submittedText;
+      await _pumpChat(
+        tester,
+        drafts: drafts,
+        remoteSubmit:
+            ({
+              required sessionId,
+              required text,
+              required onEvent,
+              required onSent,
+            }) async {
+              submitCount += 1;
+              submittedText = text;
+              // No onSent: the prompt never reached the wire, and the gateway
+              // rejected it outright (no transport marker in the message).
+              throw JsonRpcError('prompt.submit', 'Session is not available');
+            },
+      );
+
+      await tester.enterText(find.byType(TextField), 'Retry this prompt');
+      await tester.tap(find.byTooltip('Send'));
+      await tester.pump();
+      await tester.pumpAndSettle();
+
+      expect(submitCount, 1);
+      expect(submittedText, contains('Retry this prompt'));
       expect(
         find.text(
-          'Send failed: JsonRpcError(prompt.submit): '
-          'Desktop gateway connection closed',
+          'Send failed: JsonRpcError(prompt.submit): Session is not available',
         ),
         findsOneWidget,
       );
       expect(
         tester.widget<TextField>(find.byType(TextField)).controller!.text,
         'Retry this prompt',
+        reason: 'nothing was submitted, so the draft comes back',
       );
       expect(find.bySemanticsLabel('Attachment 1 of 3'), findsOneWidget);
       expect(find.bySemanticsLabel('Attachment 2 of 3'), findsOneWidget);
@@ -103,23 +174,16 @@ void main() {
         '@file:second-ref',
         '@file:third-ref',
       ]);
-
-      await tester.pump(const Duration(seconds: 10));
-      await tester.pumpAndSettle();
-      expect(submitCount, 1);
-      expect(
-        tester.widget<TextField>(find.byType(TextField)).controller!.text,
-        'Retry this prompt',
-      );
-      expect(find.bySemanticsLabel('Attachment 1 of 3'), findsOneWidget);
-      expect(find.bySemanticsLabel('Attachment 2 of 3'), findsOneWidget);
-      expect(find.bySemanticsLabel('Attachment 3 of 3'), findsOneWidget);
       expect(
         tester
             .widget<IconButton>(find.widgetWithIcon(IconButton, Icons.send))
             .onPressed,
         isNotNull,
+        reason: 'the composer is usable for an explicit retry',
       );
+
+      await tester.pump(const Duration(seconds: 10));
+      expect(submitCount, 1);
     },
   );
 }

@@ -40,9 +40,23 @@
 - 行为：上翻后新内容到达只会累计右下角"↓ N new"角标（原有能力），点它或自己滑回底部才恢复跟随；回到底部后跟随自动恢复。
 - 测试：`test/chat_history_scroll_test.dart` 新增"短促上滑不被拉回"（含角标断言）、"滑回底部恢复跟随"、以及 `isAtUserEnd` vs `isNearEnd` 的规则测试。全套 1072 个测试通过，`flutter analyze` 0 issue。
 
+### R9 — 2026-10-01（长任务中传输中断不再误报"发送失败" → R6 落地）
+- 现象（两张截图）：长任务中分别出现 `Send failed: ClientException: Connection closed while receiving data, uri=http://…:8642/v1/chat/completions`（API server/SSE 链路）与 `Send failed: JsonRpcError(prompt.submit): Desktop gateway connection closed`（dashboard WS 链路）；并且报错后右上角"Responding…"消失、右下角停止键变回发送键，而服务端**还在干活**。
+- 根因：两条发送链路都把**传输中断当成服务端拒绝**。
+  - WS 旧链路（`_sendDesktopGatewayMessage`）的 catch 完全没做区分，一律回填输入框 + 提示失败 + 清空 `_sending/_streaming`（这就是"Responding…"消失、停止键变回发送键的直接原因）。
+  - 网关自己的分类器 `_ambiguousJsonRpcFailure` 只认 `reason` 字段；而实际抛出的错误常常只有消息文本（"…connection closed"），于是被读成"确定被拒绝"。
+  - SSE 链路的 onError 同样一律 `_handleSendError(..., removePendingUserMessage: true)`。
+- 修复：
+  - 新增纯函数分类器 `lib/core/utils/send_delivery.dart::classifySendDelivery`，输入错误 + 两个事实（`responseStarted` 是否已收到内容、`deliveryStarted` 提示帧是否已写出）→ `rejected`（可以安全地把草稿还给用户）或 `uncertain`（服务端可能已经接手，只能对账）。"连接被拒/域名解析失败/HTTP 错误"仍判为 rejected，草稿照旧退回。
+  - WS 链路的 catch 在 `uncertain` 时改为：保留本地回合（`_streaming` 不动 → 继续显示"Responding…" + 停止键）、清空输入框不回填、`_pendingReattachResync` 接管（重连后自动重取历史，落地即清除），并提示"连接丢失，回复会在服务端继续并自动重连"。
+  - 落地判定：`_pendingReattachTurnFromSubmit` 标记这次挂起来自提交，`_clearPendingReattachResync()` 在终态行到达时把回合状态收尾（停止键/输入框恢复）。
+  - SSE 链路在 `uncertain` 时改为：保留回合，按 3/6/9/12…（共 8 次，约 78 秒）轮询会话历史，用"发送前已完成的助手回答数"做水位线（避免把本地半截占位符算进去），回答落地即接管并收尾；预算耗尽则诚实提示"连接丢失，Hermes 可能仍在完成——刷新查看"，**不**回填草稿。
+  - 停止键现在也会解除 pending-reattach（用户想放弃等待时的逃生口）。
+- 测试：新增 `test/send_delivery_test.dart`（分类器 8 例）、`test/chat_sse_transport_drop_test.dart`（SSE 中断保留回合 + 落地接管；未发出的连接失败仍报失败）、`test/chat_lost_acknowledgement_test.dart`（停止键解除挂起）；改写 `test/chat_reattach_resync_test.dart` 与 `test/chat_remote_submit_failure_test.dart` 中"回填草稿"的旧契约（并新增"权威拒绝仍回填"用例保留该行为）。全套 1083 个测试通过，`flutter analyze` 0 issue。
+
 ## 待办（用户提出的其余改动）
 
 - R3：界面中文化 + 设置里可切换语言（默认中文）。
 - R4：流式消息滚动行为——停在底部才自动跟随；用户上翻时不打扰。**已由 R8 落地**（2026-10-01）。
 - R5：会话历史本地缓存（打开会话不再每次全量拉取）。
-- R6：长任务中"假发送失败"（服务端已接受，APP 却提示失败并回填输入框）修复。
+- R6：长任务中"假发送失败"（服务端已接受，APP 却提示失败并回填输入框）修复。**已由 R9 落地**（2026-10-01）。
