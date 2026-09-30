@@ -83,6 +83,28 @@ void main() {
       coordinator.updateFromUserScroll(isNearEnd: true);
       expect(coordinator.streamingContentChanged(), isNotNull);
     });
+
+    test('a reader resting above the end is not "at the end"', () {
+      final coordinator = ChatScrollCoordinator();
+
+      // 150px above the end: close enough for a send to start following, far
+      // enough that the reader must not be dragged back by the next delta.
+      expect(
+        coordinator.isAtUserEnd(pixels: 1772, maxScrollExtent: 1922),
+        isFalse,
+      );
+      expect(
+        coordinator.isNearEnd(pixels: 1772, maxScrollExtent: 1922),
+        isTrue,
+      );
+
+      coordinator.beginStreaming(isNearEnd: true);
+      coordinator.updateFromUserScroll(
+        isNearEnd: coordinator.isAtUserEnd(pixels: 1772, maxScrollExtent: 1922),
+      );
+      expect(coordinator.streamingContentChanged(), isNull);
+      expect(coordinator.endStreaming(), isNull);
+    });
   });
 
   group('end affordance controller', () {
@@ -413,6 +435,113 @@ void main() {
     );
 
     testWidgets(
+      'a short flick up during streaming is not dragged back by new content',
+      (tester) async {
+        final initialMessages = _longHistory();
+        final client = _ControlledChatHttpClient(initialMessages);
+        await _pumpChat(
+          tester,
+          client: client,
+          connectionId: 'flick-up',
+          sessionId: 'flick-up',
+        );
+        final controller = _chatListController(tester);
+        expect(controller.position.pixels, controller.position.maxScrollExtent);
+
+        await tester.enterText(find.byType(TextField), 'read earlier');
+        await tester.tap(find.byTooltip('Send'));
+        await tester.pump();
+        await client.postStarted.future;
+
+        // A short flick: the finger lifts ~120px up while the momentum carries
+        // the reader far above the end. The resting position, not the lifted
+        // finger, has to decide.
+        await tester.fling(
+          find.byType(ListView).first,
+          const Offset(0, 120),
+          1400,
+        );
+        await _settleScroll(tester);
+        final resting = controller.position.pixels;
+        expect(resting, lessThan(controller.position.maxScrollExtent - 200));
+
+        client.emitToken('arriving content');
+        await tester.pump();
+        await tester.pump();
+        expect(controller.position.pixels, closeTo(resting, 0.01));
+        expect(_indicatorText(tester), '1 new');
+        expect(_goToEndSemantics(tester).value, '1 new message');
+
+        client.finish([
+          ...initialMessages,
+          {'role': 'user', 'content': 'read earlier'},
+          {'role': 'assistant', 'content': 'arriving content'},
+        ]);
+        await tester.pumpAndSettle();
+        expect(controller.position.pixels, closeTo(resting, 0.01));
+
+        await _dragToEnd(tester, controller);
+        expect(controller.position.pixels, controller.position.maxScrollExtent);
+        expect(find.bySemanticsLabel('Go to end'), findsNothing);
+      },
+    );
+
+    testWidgets('scrolling back to the end resumes the streaming follow', (
+      tester,
+    ) async {
+      final initialMessages = _longHistory();
+      final client = _ControlledChatHttpClient(initialMessages);
+      await _pumpChat(
+        tester,
+        client: client,
+        connectionId: 'flick-then-return',
+        sessionId: 'flick-then-return',
+      );
+      final controller = _chatListController(tester);
+
+      await tester.enterText(find.byType(TextField), 'keep following');
+      await tester.tap(find.byTooltip('Send'));
+      await tester.pump();
+      await client.postStarted.future;
+
+      await tester.fling(
+        find.byType(ListView).first,
+        const Offset(0, 120),
+        1400,
+      );
+      await _settleScroll(tester);
+      expect(
+        controller.position.pixels,
+        lessThan(controller.position.maxScrollExtent - 200),
+      );
+
+      // Drag back down to the end by hand; the reader is pinned again.
+      for (
+        var attempt = 0;
+        attempt < 12 &&
+            controller.position.pixels <
+                controller.position.maxScrollExtent - 1;
+        attempt++
+      ) {
+        await tester.drag(find.byType(ListView).first, const Offset(0, -600));
+        await _settleScroll(tester);
+      }
+      expect(controller.position.pixels, controller.position.maxScrollExtent);
+
+      client.emitToken(List.filled(40, 'growing response').join('\n'));
+      await tester.pump();
+      await tester.pump();
+      expect(controller.position.pixels, controller.position.maxScrollExtent);
+
+      client.finish([
+        ...initialMessages,
+        {'role': 'user', 'content': 'keep following'},
+        {'role': 'assistant', 'content': 'done'},
+      ]);
+      await tester.pumpAndSettle();
+    });
+
+    testWidgets(
       'end action stays above compact composer, IME, and attachment panel',
       (tester) async {
         tester.view.devicePixelRatio = 1;
@@ -547,6 +676,14 @@ Future<void> _dragToEnd(
   ) {
     await tester.drag(find.byType(ListView).first, const Offset(0, -600));
     await tester.pumpAndSettle();
+  }
+}
+
+/// A running turn keeps a spinner on screen, so `pumpAndSettle` never settles:
+/// pump fixed frames until a fling's ballistic scroll has stopped.
+Future<void> _settleScroll(WidgetTester tester) async {
+  for (var frame = 0; frame < 30; frame++) {
+    await tester.pump(const Duration(milliseconds: 50));
   }
 }
 

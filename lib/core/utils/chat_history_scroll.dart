@@ -19,18 +19,34 @@ class ChatScrollTarget {
 /// the returned end alignment over several bounded layout frames, but refresh
 /// and completion cannot arm it again.
 class ChatScrollCoordinator {
+  /// Distance from the end that still lets auto-follow *start* (a send).
   final double nearEndThreshold;
+
+  /// Distance from the end that still counts as "the reader is at the end"
+  /// once they have scrolled themselves. Deliberately tighter than
+  /// [nearEndThreshold]: a short flick rests well above the end, and the
+  /// position of the finger when it lifted is not where the reader landed.
+  final double userEndTolerance;
+
   bool _initialEndAlignmentConsumed = false;
   bool _streaming = false;
   bool _followStreaming = false;
 
-  ChatScrollCoordinator({this.nearEndThreshold = 200});
+  ChatScrollCoordinator({
+    this.nearEndThreshold = 200,
+    this.userEndTolerance = 48,
+  });
 
   bool get initialEndAlignmentConsumed => _initialEndAlignmentConsumed;
   bool get shouldFollowStreaming => _streaming && _followStreaming;
 
   bool isNearEnd({required double pixels, required double maxScrollExtent}) {
     return pixels >= maxScrollExtent - nearEndThreshold;
+  }
+
+  /// Whether the reader's own scroll left them at the end of the transcript.
+  bool isAtUserEnd({required double pixels, required double maxScrollExtent}) {
+    return pixels >= maxScrollExtent - userEndTolerance;
   }
 
   /// Arms normal opening-at-end exactly once for this screen instance.

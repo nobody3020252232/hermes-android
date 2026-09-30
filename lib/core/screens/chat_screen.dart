@@ -346,6 +346,9 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   final _endAffordanceController = ChatEndAffordanceController();
   bool _streamFollowScheduled = false;
   bool _initialEndFrameScheduled = false;
+  /// True between a user drag start and its scroll end, so a flick's resting
+  /// position (not the lifted finger) decides whether auto-follow continues.
+  bool _userScrollActive = false;
   double? _initialEndLastExtent;
   int _initialEndStableFrames = 0;
   int _initialEndFramesRemaining = 0;
@@ -776,6 +779,15 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     );
   }
 
+  /// Position-based twin of [_isNearEnd] for the reader's own scrolls: only a
+  /// rest at (or within a few px of) the end keeps auto-follow alive.
+  bool _isAtUserEnd(ScrollMetrics metrics) {
+    return _scrollCoordinator.isAtUserEnd(
+      pixels: metrics.pixels,
+      maxScrollExtent: metrics.maxScrollExtent,
+    );
+  }
+
   void _syncEndAffordance(
     ScrollMetrics metrics, {
     bool clearUnreadAtEnd = true,
@@ -795,14 +807,25 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   }
 
   bool _handleScrollNotification(ScrollNotification notification) {
-    final isDirectUserScroll =
-        (notification is ScrollUpdateNotification &&
-            notification.dragDetails != null) ||
-        (notification is OverscrollNotification &&
-            notification.dragDetails != null);
-    if (isDirectUserScroll) {
+    final dragDetails = switch (notification) {
+      ScrollStartNotification(:final dragDetails) => dragDetails,
+      ScrollUpdateNotification(:final dragDetails) => dragDetails,
+      _ => null,
+    };
+    if (dragDetails != null) {
+      // The reader took over: stop fighting them with the opening alignment,
+      // and remember the scroll so its rest position can decide the follow.
+      _initialEndFramesRemaining = 0;
+      _userScrollActive = true;
       _scrollCoordinator.updateFromUserScroll(
-        isNearEnd: _isNearEnd(notification.metrics),
+        isNearEnd: _isAtUserEnd(notification.metrics),
+      );
+    } else if (notification is ScrollEndNotification && _userScrollActive) {
+      // A flick's momentum decides, not where the finger lifted: a short flick
+      // that rests above the end must not be dragged back by the next delta.
+      _userScrollActive = false;
+      _scrollCoordinator.updateFromUserScroll(
+        isNearEnd: _isAtUserEnd(notification.metrics),
       );
     }
     return false;
